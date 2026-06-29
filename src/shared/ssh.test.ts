@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { buildSshArgs, parseExtraArgs, parseSshConfig } from './ssh'
+import {
+  buildSshArgs,
+  parseExtraArgs,
+  parseSshConfig,
+  posixQuote,
+  quoteRemotePath,
+  remoteTmuxCommand,
+  parseLsDirs
+} from './ssh'
 
 describe('parseSshConfig', () => {
   it('parses a named host with HostName/User/Port/IdentityFile', () => {
@@ -76,5 +84,54 @@ describe('parseExtraArgs', () => {
   it('empty/undefined → []', () => {
     expect(parseExtraArgs(undefined)).toEqual([])
     expect(parseExtraArgs('   ')).toEqual([])
+  })
+})
+
+describe('posixQuote', () => {
+  it('single-quotes and escapes embedded quotes', () => {
+    expect(posixQuote(`a b`)).toBe(`'a b'`)
+    expect(posixQuote(`it's`)).toBe(`'it'\\''s'`)
+  })
+})
+
+describe('quoteRemotePath', () => {
+  it('leaves a bare ~ unquoted so the remote shell expands it', () => {
+    expect(quoteRemotePath('~')).toBe('~')
+  })
+  it('keeps a leading ~/ unquoted and single-quotes the remainder', () => {
+    expect(quoteRemotePath('~/a b')).toBe(`~/'a b'`)
+  })
+  it('a bare ~/ stays ~/', () => {
+    expect(quoteRemotePath('~/')).toBe('~/')
+  })
+  it('fully quotes an absolute path (byte-identical to posixQuote)', () => {
+    expect(quoteRemotePath('/srv/x')).toBe(`'/srv/x'`)
+  })
+  it('only a leading ~ or ~/ is special — ~weird is fully quoted', () => {
+    expect(quoteRemotePath('~weird')).toBe(`'~weird'`)
+  })
+})
+
+describe('remoteTmuxCommand', () => {
+  it('builds attach-or-create on the remote socket with a quoted cwd', () => {
+    expect(remoteTmuxCommand({ sessionId: 'nt-x', remoteCwd: '/srv/app' })).toBe(
+      `tmux -L nodeterm-rmt new-session -A -s 'nt-x' -c '/srv/app'`
+    )
+  })
+  it('tilde-expands a home-relative cwd (leaves ~/ unquoted)', () => {
+    expect(remoteTmuxCommand({ sessionId: 'nt-x', remoteCwd: '~/project' })).toBe(
+      `tmux -L nodeterm-rmt new-session -A -s 'nt-x' -c ~/'project'`
+    )
+  })
+  it('appends a quoted program + args when given', () => {
+    expect(
+      remoteTmuxCommand({ sessionId: 'nt-x', remoteCwd: '/a', program: 'ssh', programArgs: ['-A', 'h'] })
+    ).toBe(`tmux -L nodeterm-rmt new-session -A -s 'nt-x' -c '/a' 'ssh' '-A' 'h'`)
+  })
+})
+
+describe('parseLsDirs', () => {
+  it('keeps only directory entries from `ls -1Ap`, dropping ./ and ../', () => {
+    expect(parseLsDirs('./\n../\nsrc/\nREADME.md\n.git/\nbin/\n')).toEqual(['.git', 'bin', 'src'])
   })
 })

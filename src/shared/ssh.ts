@@ -62,6 +62,59 @@ export function buildSshArgs(conn: SshConnection): string[] {
   return args
 }
 
+/** Single-quote a string for use as ONE POSIX shell token (safe inside a remote command). */
+export function posixQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Quote a remote path as one shell token, but leave a leading `~` / `~/` UNQUOTED so the remote
+ * shell tilde-expands it (single quotes suppress `~` expansion). The remainder stays quoted, so a
+ * directory name can never inject shell. `~` alone → `~`; `~/a b` → `~/'a b'`; `/srv/x` → `'/srv/x'`.
+ */
+export function quoteRemotePath(p: string): string {
+  if (p === '~') return '~'
+  if (p.startsWith('~/')) return p.length > 2 ? `~/${posixQuote(p.slice(2))}` : '~/'
+  return posixQuote(p)
+}
+
+/** Build the remote shell command that attaches-or-creates this node's remote tmux session. */
+export function remoteTmuxCommand(opts: {
+  sessionId: string
+  remoteCwd: string
+  program?: string
+  programArgs?: string[]
+  socket?: string
+}): string {
+  const socket = opts.socket ?? 'nodeterm-rmt'
+  const parts = [
+    'tmux',
+    '-L',
+    socket,
+    'new-session',
+    '-A',
+    '-s',
+    posixQuote(opts.sessionId),
+    '-c',
+    quoteRemotePath(opts.remoteCwd)
+  ]
+  if (opts.program) {
+    parts.push(posixQuote(opts.program))
+    for (const a of opts.programArgs ?? []) parts.push(posixQuote(a))
+  }
+  return parts.join(' ')
+}
+
+/** Parse `ls -1Ap <dir>` output into sorted directory names (trailing `/`), excluding . and .. */
+export function parseLsDirs(stdout: string): string[] {
+  return stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.endsWith('/') && l !== './' && l !== '../')
+    .map((l) => l.slice(0, -1))
+    .sort((a, b) => a.localeCompare(b))
+}
+
 /** A host parsed from `~/.ssh/config`, ready to seed a saved server (no id yet). */
 export interface ParsedSshHost {
   /** The `Host` alias (display label). */

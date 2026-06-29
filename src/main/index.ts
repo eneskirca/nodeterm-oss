@@ -28,6 +28,7 @@ import { initClaudeUsage } from './claude-usage'
 import { initLicense } from './license'
 import { initRemoteHost } from './remote/host-service'
 import { initRemoteClient } from './remote/client-service'
+import { initSshProject } from './remote-ssh/ssh-project'
 
 // Dev-only: NT_MULTI lets a SECOND instance run (host + client testing on one machine) with an
 // isolated userData via NT_USER_DATA — its own device-id/session/license/workspace. Never active
@@ -53,6 +54,8 @@ const sshStore = new SshStore()
 const ptyManager = new PtyManager()
 const workspaceStore = new WorkspaceStore()
 const gitService = new GitService()
+// Set once the app window is ready; used by the quit hooks to tear down SSH-project masters.
+let sshProjectManager: ReturnType<typeof initSshProject> | undefined
 
 // The single app window — kept at module scope so IPC handlers (e.g. notifications)
 // can check focus and route clicks back to the renderer.
@@ -350,6 +353,7 @@ app.whenReady().then(async () => {
   initLicense(win)
   initRemoteHost(win, ptyManager)
   initRemoteClient(win, { isPackaged: app.isPackaged })
+  sshProjectManager = initSshProject(win)
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -358,7 +362,11 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   ptyManager.killAll()
+  sshProjectManager?.disconnectAll()
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => ptyManager.killAll())
+app.on('before-quit', () => {
+  ptyManager.killAll()
+  sshProjectManager?.disconnectAll()
+})

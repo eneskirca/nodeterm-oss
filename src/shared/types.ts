@@ -22,6 +22,8 @@ export interface PtyCreateOptions {
    * real value in a later phase.
    */
   agentId?: AgentId
+  /** When set, this PTY runs on a remote host over the project's ssh ControlMaster, in remote tmux. */
+  sshRemote?: { controlPath: string; conn: import('./ssh').SshConnection; remoteCwd: string }
 }
 
 /**
@@ -60,6 +62,8 @@ export interface CanvasNodeState {
   agentId?: AgentId
   /** When set, the terminal runs `ssh` to this host on the local PTY; persisted (auto-reconnects). */
   ssh?: import('./ssh').SshConnection
+  /** When true (SSH-project terminals), the node runs in REMOTE tmux on `ssh` rather than `ssh`-on-local-PTY. */
+  sshRemoteTmux?: boolean
   // sticky-only
   text?: string
   // dino-only: best score reached in the T-Rex Runner game.
@@ -111,6 +115,8 @@ export interface Project {
   color: string
   /** Default working directory for new terminals created in this project. */
   cwd?: string
+  /** When set, this is an SSH project: its terminals run on `server` in `remoteCwd` (remote tmux). */
+  ssh?: { server: import('./ssh').SshConnection; remoteCwd: string }
   viewport: Viewport
   nodes: CanvasNodeState[]
   /** Bridge links between Claude nodes (optional; absent in pre-bridge files). */
@@ -303,6 +309,25 @@ export interface SshApi {
   remove(id: string): Promise<import('./ssh').SshServer[]>
   /** Parse `~/.ssh/config` into importable hosts (empty if none). */
   importCandidates(): Promise<import('./ssh').ParsedSshHost[]>
+}
+
+export type SshProjectStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting' | 'error'
+
+export interface SshProjectApi {
+  /** Open (or reuse) the ControlMaster for an SSH project; resolves once connected. */
+  connect(projectId: string, server: import('./ssh').SshConnection): Promise<{ controlPath: string }>
+  /** Tear down the master (remote tmux is unaffected). */
+  disconnect(projectId: string): Promise<void>
+  /**
+   * End the given terminal nodes' REMOTE tmux sessions over the project's live master.
+   * Authoritative teardown on project delete: works regardless of whether the nodes are
+   * mounted, and must be awaited BEFORE disconnect (which kills the master). `nodeIds` are
+   * raw node ids; main maps them to `nt-<id>` session names.
+   */
+  killSessions(projectId: string, nodeIds: string[]): Promise<void>
+  /** List remote sub-directories of `path` (default ~). */
+  listDir(projectId: string, path: string): Promise<{ path: string; dirs: string[] }>
+  onStatus(cb: (e: { projectId: string; status: SshProjectStatus; error?: string }) => void): () => void
 }
 
 export interface GitFileChange {
@@ -720,6 +745,7 @@ export interface NodeTerminalApi {
   dialog: DialogApi
   settings: SettingsApi
   ssh: SshApi
+  sshProject: SshProjectApi
   git: GitApi
   clipboard: ClipboardApi
   shell: ShellApi
