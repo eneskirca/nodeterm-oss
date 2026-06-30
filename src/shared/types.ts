@@ -23,7 +23,7 @@ export interface PtyCreateOptions {
    */
   agentId?: AgentId
   /** When set, this PTY runs on a remote host over the project's ssh ControlMaster, in remote tmux. */
-  sshRemote?: { controlPath: string; conn: import('./ssh').SshConnection; remoteCwd: string }
+  sshRemote?: { controlPath: string; conn: import('./ssh').SshConnection; remoteCwd: string; hookEndpointPath?: string; tmuxConfPath?: string }
 }
 
 /**
@@ -47,6 +47,12 @@ export interface CanvasNodeState {
   position: { x: number; y: number }
   size: { width: number; height: number }
   title: string
+  /**
+   * Agent nodes only: while true (the default), the node title auto-tracks the agent's own
+   * session name. Set false once the user renames the node by hand, so we stop overwriting it
+   * and instead push the user's name back to the agent via `/rename`. Persisted.
+   */
+  titleAuto?: boolean
   color: string
   group: string | null
   /** Labels for organizing/filtering terminals. */
@@ -64,6 +70,8 @@ export interface CanvasNodeState {
   ssh?: import('./ssh').SshConnection
   /** When true (SSH-project terminals), the node runs in REMOTE tmux on `ssh` rather than `ssh`-on-local-PTY. */
   sshRemoteTmux?: boolean
+  /** editor-only: when true (SSH-project editors), reads/writes go to the project's remote fs via `sshFs`. */
+  sshFs?: boolean
   // sticky-only
   text?: string
   // dino-only: best score reached in the T-Rex Runner game.
@@ -121,6 +129,12 @@ export interface Project {
   nodes: CanvasNodeState[]
   /** Bridge links between Claude nodes (optional; absent in pre-bridge files). */
   bridges?: BridgeLink[]
+  /**
+   * Closed projects are hidden from the tab bar but kept on disk with all their nodes (and their
+   * tmux sessions left running) so they can be reopened from the start screen's "Recently closed"
+   * list. Absent/false = an open tab. A closed project never becomes `activeProjectId`.
+   */
+  closed?: boolean
 }
 
 /** The full workspace written to / read from disk. */
@@ -172,6 +186,9 @@ export interface PtyApi {
   readScrollback(persistKey: string): Promise<string>
   /** Send literal text + Enter into a session (e.g. a slash command). Returns false if unavailable. */
   sendText(persistKey: string, text: string): Promise<boolean>
+  /** The agent session's display name (`/rename` name, else auto name) read from its transcript;
+   *  null if none. Used to keep a node title in sync with the `/resume` name (e.g. after resume). */
+  readSessionName(sessionId: string, cwd: string): Promise<string | null>
   /** Listens for PTY output. Returns an unsubscribe function. */
   onData(sessionId: string, listener: (data: string) => void): () => void
   /** Fires when the PTY process exits. Returns an unsubscribe function. */
@@ -261,6 +278,9 @@ export interface Settings {
   seenShortcuts: boolean
   /** Notify (OS notification) when a Claude Code turn finishes while the app is in the background. */
   notifyOnClaudeDone: boolean
+  /** Periodically `git fetch` while the Source Control panel is open, so ahead/behind stays
+   *  accurate (remote/SSH projects fetch on the remote). */
+  gitAutoFetch: boolean
   /** Whether the one-time notification consent prompt has been shown. */
   notifyConsentAsked: boolean
   /** User-defined agents (BYO CLI) appended to the Add menus. */
@@ -291,6 +311,7 @@ export const DEFAULT_SETTINGS: Settings = {
   commitExtraPrompt: '',
   seenShortcuts: false,
   notifyOnClaudeDone: true,
+  gitAutoFetch: true,
   notifyConsentAsked: false,
   customAgents: [],
   disabledAgents: [],
@@ -315,7 +336,11 @@ export type SshProjectStatus = 'connecting' | 'connected' | 'disconnected' | 're
 
 export interface SshProjectApi {
   /** Open (or reuse) the ControlMaster for an SSH project; resolves once connected. */
-  connect(projectId: string, server: import('./ssh').SshConnection): Promise<{ controlPath: string }>
+  connect(
+    projectId: string,
+    server: import('./ssh').SshConnection,
+    remoteCwd?: string
+  ): Promise<{ controlPath: string; hookEndpointPath?: string; tmuxConfPath?: string }>
   /** Tear down the master (remote tmux is unaffected). */
   disconnect(projectId: string): Promise<void>
   /**
@@ -327,7 +352,29 @@ export interface SshProjectApi {
   killSessions(projectId: string, nodeIds: string[]): Promise<void>
   /** List remote sub-directories of `path` (default ~). */
   listDir(projectId: string, path: string): Promise<{ path: string; dirs: string[] }>
+  /** Create a remote directory (mkdir -p). Resolves false when not connected or the mkdir fails. */
+  mkdir(projectId: string, path: string): Promise<boolean>
+  /**
+   * Upload a local file to the remote over the project's ControlMaster, into
+   * `<remoteHome>/.nodeterm/uploads/<token>/<fileName>`. Resolves the ABSOLUTE remote path on
+   * success, or null on any failure (not connected, unresolved remote home, mkdir/scp failure).
+   */
+  uploadFile(projectId: string, localPath: string, fileName: string): Promise<string | null>
   onStatus(cb: (e: { projectId: string; status: SshProjectStatus; error?: string }) => void): () => void
+}
+
+/**
+ * SSH-project Explorer/Editor filesystem API: the same `FsApi` contract scoped to a project,
+ * proxied over the project's ControlMaster (renderer → `sshFs:*` IPC → main `SshFs`). The renderer
+ * `sshFs(projectId)` helper closes over `projectId` to expose a plain `FsApi`. Mirrors
+ * `RemoteClientApi.fs*` for relay connections; fails open ([]/''/false) when the project is not
+ * connected.
+ */
+export interface SshFsApi {
+  list(projectId: string, path: string): Promise<DirEntry[]>
+  read(projectId: string, path: string): Promise<string>
+  readBinary(projectId: string, path: string): Promise<string>
+  write(projectId: string, path: string, content: string): Promise<boolean>
 }
 
 export interface GitFileChange {
@@ -427,6 +474,9 @@ export interface GitApi {
   worktreeAdd(repoPath: string, wtPath: string, branch: string, baseRef: string, isNew: boolean): Promise<GitResult>
   worktreeMerge(repoPath: string, branch: string, baseRef: string): Promise<GitResult>
   worktreeRemove(repoPath: string, wtPath: string, deleteBranch: boolean): Promise<GitResult>
+  /** Scope remote git routing to the active project: pass its id to route git over that SSH
+   *  project's master, or null for a local project so all git ops run locally. */
+  setActiveRemote(projectId: string | null): Promise<void>
 }
 
 export interface UpdateInfo {
@@ -604,6 +654,21 @@ export interface ChatApi {
   ): Promise<ChatMessage[]>
 }
 
+/** One ranked search hit across all on-disk Claude session transcripts. */
+export interface TranscriptHit {
+  sessionId: string
+  title: string
+  snippet: string
+  cwd: string
+  projectLabel: string
+  mtime: number
+}
+
+export interface TranscriptsApi {
+  /** Search all on-disk Claude session transcripts by content. */
+  search(query: string): Promise<TranscriptHit[]>
+}
+
 export interface ClaudeApi {
   /**
    * Reads a Claude session's full transcript as flat searchable lines ([] if unavailable).
@@ -746,6 +811,7 @@ export interface NodeTerminalApi {
   settings: SettingsApi
   ssh: SshApi
   sshProject: SshProjectApi
+  sshFs: SshFsApi
   git: GitApi
   clipboard: ClipboardApi
   shell: ShellApi
@@ -759,6 +825,7 @@ export interface NodeTerminalApi {
   context: ContextApi
   claude: ClaudeApi
   chat: ChatApi
+  transcripts: TranscriptsApi
   remoteHost: RemoteHostApi
   remoteClient: RemoteClientApi
   handoff: HandoffApi

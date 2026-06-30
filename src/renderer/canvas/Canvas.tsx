@@ -81,12 +81,15 @@ import {
   agentConfig,
   hasHooks,
   canBranch,
+  canRename,
   canTransferFrom,
   canContextLink,
+  resumeCommand,
   AGENT_CONFIG,
   BUILTIN_AGENT_IDS,
   type AgentId
 } from '@shared/agents/config'
+import { relativeTime } from '../lib/relativeTime'
 import { AgentIcon } from '../lib/agentIcons'
 import { branchClaudeSession } from '../lib/claudeBranch'
 import { useSettings } from '../state/settings'
@@ -96,7 +99,7 @@ import { useSshServers } from '../state/sshServers'
 import { useSshConn } from '../state/sshConn'
 import { requireProOr } from '../state/upgradeGate'
 import type { SshServer } from '@shared/ssh'
-import type { SshProjectStatus } from '@shared/types'
+import type { SshProjectStatus, TranscriptHit } from '@shared/types'
 import {
   applyCanvasMutation,
   claudeLaunchCommand,
@@ -139,6 +142,10 @@ export function Canvas() {
   const [remotePicker, setRemotePicker] = useState<{ x: number; y: number } | null>(null)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [fileIndex, setFileIndex] = useState<QuickOpenIndexedFile[]>([])
+  const [transcriptHits, setTranscriptHits] = useState<TranscriptHit[]>([])
+  const transcriptQueryRef = useRef('')
+  // Pending debounce timer for the palette transcript search (reset on each keystroke).
+  const transcriptSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Cached visible-buffer text per terminal, for command-palette content search.
   const [bufferCache, setBufferCache] = useState<Record<string, string>>({})
   const captureTsRef = useRef<Record<string, number>>({})
@@ -221,7 +228,10 @@ export function Canvas() {
     useReactFlow()
 
   const activeProjectId = useProjects((s) => s.activeProjectId)
-  const hasProjects = useProjects((s) => s.projects.length > 0)
+  // "Has projects" = at least one OPEN (non-closed) tab. With only closed projects left, the
+  // welcome screen shows (and lists them under "Recently closed" for reopening).
+  const hasProjects = useProjects((s) => s.projects.some((p) => !p.closed))
+  const closedProjects = useProjects((s) => s.projects.filter((p) => p.closed))
   // The active project's SSH server (if it's an SSH project) — drives the connection banner.
   const activeSshServer = useProjects(
     (s) => s.projects.find((p) => p.id === s.activeProjectId)?.ssh?.server
@@ -505,11 +515,19 @@ export function Canvas() {
     // switch back to a connected project is a no-op. Remote tmux is unaffected by the master.
     if (project.ssh) {
       window.nodeTerminal.sshProject
-        .connect(project.id, project.ssh.server)
-        .then(({ controlPath }) => useSshConn.getState().setControlPath(project.id, controlPath))
+        .connect(project.id, project.ssh.server, project.ssh.remoteCwd)
+        .then(async ({ controlPath, hookEndpointPath, tmuxConfPath }) => {
+          // Arm remote git routing for the active project BEFORE the sshConn entry appears, so the
+          // Source Control panel's re-fetch (which keys off that entry) already hits the master.
+          await window.nodeTerminal.git.setActiveRemote(project.id)
+          useSshConn.getState().setConn(project.id, { controlPath, hookEndpointPath, tmuxConfPath })
+        })
         .catch(() => {
           /* status surfaced via onStatus → the connection banner */
         })
+    } else {
+      // Local active project: ensure all git ops run local (no stale remote from a prior SSH tab).
+      void window.nodeTerminal.git.setActiveRemote(null)
     }
     loadingRef.current = true
     const flow = nodeStatesToFlow(project.nodes)
@@ -922,10 +940,12 @@ export function Canvas() {
     }
   }, [mountRemoteMirror])
 
-  /** Open a file as a code editor node on the canvas. */
+  /** Open a file as a code editor node on the canvas. `sshFs` must be passed explicitly by the
+   *  caller: only genuinely-remote, Explorer-opened files in an SSH project pass `true`; native
+   *  dialog / quick-open paths are LOCAL and stay local (so their ⌘S never writes to the host). */
   const openFile = useCallback(
-    (filePath: string, center?: { x: number; y: number }) => {
-      setNodes((ns) => [...ns, createEditorNode(ns.length, filePath, center ?? viewCenter())])
+    (filePath: string, center?: { x: number; y: number }, sshFs?: boolean) => {
+      setNodes((ns) => [...ns, createEditorNode(ns.length, filePath, center ?? viewCenter(), sshFs)])
       markDirty()
     },
     [setNodes, markDirty, viewCenter]
@@ -973,7 +993,10 @@ export function Canvas() {
   /** Open a git diff editor node for a changed file (from Source Control). */
   const openDiff = useCallback(
     (relPath: string, staged: boolean) => {
-      const cwd = useProjects.getState().getProject(activeProjectId)?.cwd
+      const project = useProjects.getState().getProject(activeProjectId)
+      // SSH project: the diff node operates on the remote repo, so its cwd must be the exact
+      // remoteCwd (the git remote registry matches by exact string; same value passed to connect).
+      const cwd = project?.ssh?.remoteCwd ?? project?.cwd
       if (!cwd) return
       setNodes((ns) => [...ns, createDiffNode(ns.length, cwd, relPath, staged, viewCenter())])
       markDirty()
@@ -984,7 +1007,8 @@ export function Canvas() {
   /** Open a parent↔commit diff node for a file from the history graph. */
   const openCommitDiff = useCallback(
     (relPath: string, commitOid: string) => {
-      const cwd = useProjects.getState().getProject(activeProjectId)?.cwd
+      const project = useProjects.getState().getProject(activeProjectId)
+      const cwd = project?.ssh?.remoteCwd ?? project?.cwd
       if (!cwd) return
       setNodes((ns) => [...ns, createDiffNode(ns.length, cwd, relPath, false, viewCenter(), commitOid)])
       markDirty()
@@ -1565,7 +1589,14 @@ export function Canvas() {
     (node: Node) => {
       const w = node.measured?.width ?? (node.width as number) ?? 0
       const h = node.measured?.height ?? (node.height as number) ?? 0
-      setCenter(node.position.x + w / 2, node.position.y + h / 2, {
+      // A grouped node's position is relative to its parent group frame — convert to absolute
+      // before centering, or focusing a session inside a group jumps to the wrong spot.
+      const parent = node.parentId
+        ? nodesRef.current.find((p) => p.id === node.parentId)
+        : undefined
+      const x = node.position.x + (parent?.position.x ?? 0)
+      const y = node.position.y + (parent?.position.y ?? 0)
+      setCenter(x + w / 2, y + h / 2, {
         zoom: Math.max(getZoom(), 1),
         duration: 300
       })
@@ -1865,6 +1896,53 @@ export function Canvas() {
     [setNodes, goToNode, switchProject]
   )
 
+  const onPaletteQuery = useCallback((q: string) => {
+    transcriptQueryRef.current = q
+    // Reset any pending search so rapid keystrokes only fire one IPC call.
+    if (transcriptSearchTimer.current) clearTimeout(transcriptSearchTimer.current)
+    if (q.trim().length < 2) {
+      setTranscriptHits([])
+      return
+    }
+    const mine = q
+    // Debounce the actual search by ~180ms.
+    transcriptSearchTimer.current = setTimeout(() => {
+      window.nodeTerminal.transcripts.search(q).then((hits) => {
+        // Stale-response guard: ignore results for a query the user has moved past.
+        if (transcriptQueryRef.current === mine) setTranscriptHits(hits)
+      })
+    }, 180)
+  }, [])
+
+  // Map a transcript hit's sessionId to a live node (via agentStatus). If that node still
+  // exists anywhere, focus it; otherwise open a new Claude node that resumes the session.
+  const openTranscriptHit = useCallback(
+    (hit: TranscriptHit) => {
+      const byId = useAgentStatus.getState().byId
+      const projects = useProjects.getState().projects
+      const boundNodeId = Object.entries(byId).find(
+        ([nodeId, st]) =>
+          st.sessionId === hit.sessionId &&
+          (nodesRef.current.some((n) => n.id === nodeId) ||
+            projects.some((p) => p.nodes.some((n) => n.id === nodeId)))
+      )?.[0]
+      if (boundNodeId) {
+        focusNodeById(boundNodeId)
+        return
+      }
+      // No live node — open a resume node in the active project, using the transcript's cwd.
+      const cmd = resumeCommand('claude', hit.sessionId)
+      if (!cmd) return
+      const node = createAgentNode('claude', nodesRef.current.length, hit.cwd, viewCenter())
+      node.data = { ...node.data, initialCommand: cmd }
+      node.selected = true
+      setNodes((ns) => [...ns.map((n) => ({ ...n, selected: false })), node])
+      markDirty()
+      goToNode(node)
+    },
+    [focusNodeById, setNodes, markDirty, goToNode, viewCenter]
+  )
+
   useEffect(() => window.nodeTerminal.onFocusNode(focusNodeById), [focusNodeById])
 
   // ---- sessions sidebar actions ----
@@ -1895,11 +1973,26 @@ export function Canvas() {
   const renameSession = useCallback(
     (projectId: string, id: string, title: string) => {
       if (projectId === activeProjectId) {
-        setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title } } : n)))
+        // An explicit rename takes ownership of the name → stop auto-tracking the session.
+        setNodes((ns) =>
+          ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title, titleAuto: false } } : n))
+        )
         markDirty()
       } else {
         useProjects.getState().renameNode(projectId, id, title)
         void writeDisk()
+      }
+      // Mirror the new name into a rename-capable agent's live session (tmux send-keys works
+      // whether or not the node is currently mounted). Same one-way push as the node header's ✦.
+      const liveAgent = nodesRef.current.find((n) => n.id === id)?.data.agentId as AgentId | undefined
+      const storedAgent = useProjects
+        .getState()
+        .projects.find((p) => p.id === projectId)
+        ?.nodes.find((n) => n.id === id)?.agentId
+      const agentId = liveAgent ?? storedAgent
+      const name = title.trim()
+      if (agentId && canRename(agentId) && name) {
+        void window.nodeTerminal.pty.sendText(id, `/rename ${name}`)
       }
     },
     [activeProjectId, setNodes, markDirty, writeDisk]
@@ -2232,6 +2325,34 @@ export function Canvas() {
     [persist]
   )
 
+  // Close a project: hide it from the tab bar but keep it (and its tmux/agent sessions) intact
+  // so it can be reopened later from the start screen. Non-destructive — the inverse of the old
+  // "Delete project". Switching away unmounts its nodes (a detach, not a kill); the sessions
+  // survive exactly like a project switch, and a cold restart later reconstructs them.
+  const closeProject = useCallback(
+    (id: string) => {
+      const store = useProjects.getState()
+      if (id === store.activeProjectId) commitActiveToStore()
+      store.closeProject(id)
+      void writeDisk()
+    },
+    [commitActiveToStore, writeDisk]
+  )
+
+  // Reopen a previously closed project and make it active — the active-project effect reloads its
+  // serialized nodes, whose TerminalNodes reattach to the surviving tmux sessions (or cold-restore).
+  const reopenProject = useCallback(
+    (id: string) => {
+      commitActiveToStore()
+      useProjects.getState().reopenProject(id)
+      setWelcomeOpen(false)
+      void writeDisk()
+    },
+    [commitActiveToStore, writeDisk]
+  )
+
+  // Permanently remove a project (from the "Recently closed" list): end every terminal's tmux
+  // session, drop persisted agent status, tear down any SSH master, then delete it from disk.
   const deleteProject = useCallback(
     (id: string) => {
       const store = useProjects.getState()
@@ -2263,6 +2384,20 @@ export function Canvas() {
       void writeDisk()
     },
     [commitActiveToStore, writeDisk]
+  )
+
+  const now = useMemo(() => Date.now(), [transcriptHits])
+  const transcriptCommands = useMemo<Command[]>(
+    () =>
+      transcriptHits.map((hit) => ({
+        id: `transcript:${hit.sessionId}`,
+        label: hit.title || hit.sessionId,
+        hint: [hit.projectLabel, relativeTime(hit.mtime, now)].filter(Boolean).join(' · '),
+        section: 'Conversations',
+        icon: <AgentIcon agentId="claude" />,
+        run: () => openTranscriptHit(hit)
+      })),
+    [transcriptHits, openTranscriptHit, now]
   )
 
   const buildCommands = useCallback((): Command[] => {
@@ -2333,13 +2468,25 @@ export function Canvas() {
           (n.data.agentId as AgentId | undefined) ?? (tags.includes('claude') ? 'claude' : undefined)
         const isAgent = !!a && hasHooks(a)
         const session = isAgent ? cs.byId[n.id]?.session : undefined
+        // Show the running agent's icon (claude/codex/gemini/custom) when the node is an agent,
+        // otherwise an icon matching the node kind — mirrors the right-click/add-node actions.
+        const icon = a ? (
+          <AgentIcon agentId={a} />
+        ) : n.type === 'editor' ? (
+          <IconEditor />
+        ) : n.type === 'sticky' ? (
+          <IconNote />
+        ) : (
+          <IconTerminal />
+        )
         cmds.push({
           id: `node-${n.id}`,
           label: `Go to ${n.data.title}`,
+          section: 'Opened terminals',
           hint: [tags.join(' '), session, isAgent ? `nt-${n.id}` : '']
             .filter(Boolean)
             .join(' '),
-          icon: <IconJump />,
+          icon,
           content: bufferCache[n.id],
           run: () => goToNode(n)
         })
@@ -2368,7 +2515,7 @@ export function Canvas() {
         onOpenWelcome={() => setWelcomeOpen(true)}
         onRename={renameProject}
         onSetFolder={setProjectFolder}
-        onDelete={deleteProject}
+        onCloseProject={closeProject}
         onRemoteAccess={() => setRemoteDialogOpen(true)}
       />
 
@@ -2539,6 +2686,9 @@ export function Canvas() {
               setWelcomeOpen(false)
               setSshDialogOpen(true)
             }}
+            closedProjects={closedProjects.map((p) => ({ id: p.id, name: p.name, cwd: p.cwd }))}
+            onReopen={reopenProject}
+            onDeleteClosed={deleteProject}
             onClose={hasProjects ? () => setWelcomeOpen(false) : undefined}
           />
         )}
@@ -2573,7 +2723,13 @@ export function Canvas() {
           fileIndex={fileIndex}
           onOpenFile={openProjectFile}
           onRevealFile={revealProjectFile}
-          onClose={() => setPaletteOpen(false)}
+          onQueryChange={onPaletteQuery}
+          extraCommands={transcriptCommands}
+          onClose={() => {
+            setPaletteOpen(false)
+            setTranscriptHits([])
+            if (transcriptSearchTimer.current) clearTimeout(transcriptSearchTimer.current)
+          }}
         />
       )}
 
@@ -2594,7 +2750,11 @@ export function Canvas() {
       {shortcutsOpen && <ShortcutsPanel onClose={() => setShortcutsOpen(false)} />}
 
       {explorerOpen && (
-        <ExplorerPanel onClose={() => setExplorerOpen(false)} onOpenFile={openFile} reveal={reveal} />
+        <ExplorerPanel
+          onClose={() => setExplorerOpen(false)}
+          onOpenFile={(path, isSsh) => openFile(path, undefined, isSsh)}
+          reveal={reveal}
+        />
       )}
 
       <SessionsSidebar

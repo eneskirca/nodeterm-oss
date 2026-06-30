@@ -53,6 +53,8 @@ const api: NodeTerminalApi = {
     capture: (persistKey, full) => ipcRenderer.invoke(IPC.ptyCapture, persistKey, full),
     readScrollback: (persistKey) => ipcRenderer.invoke(IPC.ptyReadScrollback, persistKey),
     sendText: (persistKey, text) => ipcRenderer.invoke(IPC.ptySendText, persistKey, text),
+    readSessionName: (sessionId, cwd) =>
+      ipcRenderer.invoke(IPC.ptyReadSessionName, sessionId, cwd),
     onData: (sessionId, listener) => {
       const channel = IPC.ptyData(sessionId)
       const handler = (_e: unknown, data: string) => listener(data)
@@ -85,16 +87,28 @@ const api: NodeTerminalApi = {
     importCandidates: () => ipcRenderer.invoke(IPC.sshImport)
   },
   sshProject: {
-    connect: (projectId, conn) => ipcRenderer.invoke(IPC.sshConnectProject, projectId, conn),
+    connect: (projectId, conn, remoteCwd) =>
+      ipcRenderer.invoke(IPC.sshConnectProject, projectId, conn, remoteCwd),
     disconnect: (projectId) => ipcRenderer.invoke(IPC.sshDisconnectProject, projectId),
     killSessions: (projectId, nodeIds) =>
       ipcRenderer.invoke(IPC.sshKillSessions, projectId, nodeIds),
     listDir: (projectId, dir) => ipcRenderer.invoke(IPC.sshListDir, projectId, dir),
+    mkdir: (projectId, dir) => ipcRenderer.invoke(IPC.sshMkdir, projectId, dir),
+    uploadFile: (projectId, localPath, fileName) =>
+      ipcRenderer.invoke(IPC.sshUploadFile, projectId, localPath, fileName),
     onStatus: (cb) => {
       const h = (_e: unknown, e: unknown) => cb(e as never)
       ipcRenderer.on(IPC.sshProjectStatus, h)
       return () => ipcRenderer.removeListener(IPC.sshProjectStatus, h)
     }
+  },
+  sshFs: {
+    list: (projectId: string, path: string) => ipcRenderer.invoke(IPC.sshFsList, projectId, path),
+    read: (projectId: string, path: string) => ipcRenderer.invoke(IPC.sshFsRead, projectId, path),
+    readBinary: (projectId: string, path: string) =>
+      ipcRenderer.invoke(IPC.sshFsReadBinary, projectId, path),
+    write: (projectId: string, path: string, content: string) =>
+      ipcRenderer.invoke(IPC.sshFsWrite, projectId, path, content)
   },
   git: {
     status: (cwd) => ipcRenderer.invoke(IPC.gitStatus, cwd),
@@ -137,7 +151,8 @@ const api: NodeTerminalApi = {
     worktreeMerge: (repoPath, branch, baseRef) =>
       ipcRenderer.invoke(IPC.gitWorktreeMerge, repoPath, branch, baseRef),
     worktreeRemove: (repoPath, wtPath, deleteBranch) =>
-      ipcRenderer.invoke(IPC.gitWorktreeRemove, repoPath, wtPath, deleteBranch)
+      ipcRenderer.invoke(IPC.gitWorktreeRemove, repoPath, wtPath, deleteBranch),
+    setActiveRemote: (projectId) => ipcRenderer.invoke(IPC.gitSetActiveRemote, projectId)
   },
   clipboard: {
     writeText: (text: string) => clipboard.writeText(text)
@@ -225,6 +240,9 @@ const api: NodeTerminalApi = {
   chat: {
     readTranscript: (sessionId, cwd) =>
       ipcRenderer.invoke(IPC.chatReadTranscript, sessionId, cwd)
+  },
+  transcripts: {
+    search: (query: string) => ipcRenderer.invoke(IPC.transcriptSearch, query)
   },
   remoteHost: {
     start: () => ipcRenderer.invoke(IPC.remoteHostStart),

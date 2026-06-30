@@ -91,9 +91,14 @@ project's nodes only.** The contract:
 - Switching away unmounts the old project's `TerminalNode`s → their tmux clients detach but
   the sessions keep running; switching back reattaches. tmux session names are per-node-id
   (globally unique), so projects never collide.
-- Deleting a project calls `transport.destroy(nodeId)` for each of its terminals (ending
-  their tmux sessions). Deleting the **last** project is allowed → projects empty →
-  `WelcomeScreen` (New project / Open folder / Clone repo).
+- The tab caret menu's **Close project** (`closeProject`) is **non-destructive**: it sets
+  `project.closed = true` (hidden from the tab bar, kept on disk with all nodes) and leaves the
+  tmux sessions running, so closing just detaches like a project switch. Closed projects are
+  reopenable from the **"Recently closed"** list on `WelcomeScreen` (`reopenProject` → restores
+  nodes, which reattach warm or cold-restore). `hasProjects` counts only **open** projects, so
+  closing the last open one shows the welcome screen. **Permanent** deletion (`deleteProject`:
+  `transport.destroy(nodeId)` per terminal + drop agent status + SSH teardown) now only happens
+  via the `×` on a "Recently closed" entry.
 - A project's `cwd` (folder picker, `dialog:select-folder`) is passed to terminal/Claude
   node factories so new terminals open there. **Folder ↔ project is deduped:** "Open folder…"
   reuses the existing project with that `cwd` (and its nodes) instead of creating a duplicate.
@@ -239,8 +244,24 @@ persisted — only `unread`/`session`/`sessionId` go to localStorage under
   `app:focus-node` → `Canvas.focusNodeById` (selects + centers, switching projects via
   `pendingFocusRef` if needed). A one-time consent prompt gates notifications; toggle in
   Settings (`notifyOnClaudeDone`). Unread clears on focus/select.
-- **Session name** — Claude's terminal title (via `term.onTitleChange`, filtered to non-path
-  strings) is stored as `session` and shown as a chip beside the editable title.
+- **Session name ⇄ node title** (agents in `RENAME_CAPABLE`, Claude-only) — two-way sync between a
+  node's `title` and the agent's own session name (the name shown in `/resume`).
+  - **session → title (read):** the authoritative name lives in the transcript `.jsonl`, not the
+    OSC terminal title (`/rename` does **not** update OSC — a known Claude gap — so reading the
+    file is the only thing that works after a **resume**). `main/transcript-reader.ts`
+    `readSessionName(sessionId, cwd)` resolves the session file (by sessionId, else newest under
+    the cwd slug) and `pickSessionName` returns the latest `custom-title`'s `customTitle` (the
+    `/rename` name) else the latest `ai-title`'s `aiTitle` (auto name). Exposed over
+    `pty.readSessionName`. `TerminalNode` polls it (~4 s) **only while the title still auto-tracks**
+    (`data.titleAuto`, default true on agent nodes) and adopts it as the `title`. `term.onTitleChange`
+    now feeds the `session` chip only.
+  - **title → session (write):** the moment the user renames the node by hand (header rename box /
+    ✦ AI-name / sidebar / command palette → all funnel through `applyManualTitle` or
+    `renameSession`), `titleAuto` flips to **false** (polling stops overwriting) and the chosen name
+    is pushed into the live session as `/rename <name>` via `pty.sendText` (tmux `send-keys`, same
+    one-way bridge as Branch's `/branch`; works whether or not the node is mounted).
+  - The launch command is left bare (no `-n`) — Claude's own name is canonical until the user
+    overrides it; `titleAuto` is persisted so an overridden name survives reload/resume.
 - **Search** — the command palette (⌘K) matches the session name + tags + `nt-<id>` in the
   hint, and substring-searches each terminal's **visible buffer** (captured via `pty.capture`
   on palette open, cached ~3s); content matches show "found in output".

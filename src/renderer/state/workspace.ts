@@ -28,6 +28,12 @@ export const COLLAPSED_HEIGHT = 40
 /** User data carried in the React Flow node's data field. */
 export interface NodeData {
   title: string
+  /**
+   * Agent nodes only: while true (the default for agent nodes), the title auto-tracks the
+   * agent's session name (see TerminalNode's onTitleChange). Flipped to false the moment the
+   * user renames the node by hand — then the user's name is pushed back via `/rename`.
+   */
+  titleAuto?: boolean
   color: string
   group: string | null
   tags?: string[]
@@ -70,6 +76,12 @@ export interface NodeData {
    * (LocalTransport passes `sshRemote` to the PTY), rather than plain `ssh`-on-local-PTY. Persisted.
    */
   sshRemoteTmux?: boolean
+  /**
+   * editor-only: when true (an editor created in an SSH project), reads/writes/image-previews go to
+   * the project's REMOTE filesystem via `sshFs(projectId)` instead of the local fs. Persisted, so an
+   * SSH-project editor still routes to the remote fs after reopen.
+   */
+  sshFs?: boolean
   [key: string]: unknown
 }
 
@@ -240,6 +252,8 @@ export function createAgentNode(
     style: { width: TERMINAL_SIZE.width, height: TERMINAL_SIZE.height },
     data: {
       title: label,
+      // Adopt the agent's own session name into the title until the user renames it by hand.
+      titleAuto: true,
       color,
       group: null,
       tags: [],
@@ -260,11 +274,19 @@ export function createClaudeNode(
   return createAgentNode('claude', index, cwd, center)
 }
 
-/** Creates a code editor node for a file. */
+/**
+ * Creates a code editor node for a file. When `sshFs` is true, `data.sshFs` is stamped so EditorNode
+ * reads/writes over the project's remote fs (`sshFs`) and `filePath` is the remote path — mirroring
+ * how `createTerminalNode` stamps `data.sshRemoteTmux`. The SSH-ness is passed EXPLICITLY by the
+ * caller (only genuinely-remote, Explorer-opened files pass `true`); native-dialog-opened files
+ * carry LOCAL paths and must stay local, so they omit it. (Self-detecting the active SSH project
+ * here would wrongly stamp a dialog-opened local path and route its ⌘S write to the remote host.)
+ */
 export function createEditorNode(
   index: number,
   filePath: string,
-  center?: { x: number; y: number }
+  center?: { x: number; y: number },
+  sshFs?: boolean
 ): CanvasNode {
   return {
     id: nextId('editor'),
@@ -277,7 +299,8 @@ export function createEditorNode(
       title: filePath.split('/').pop() || 'untitled',
       color: '#6ac4dc',
       group: null,
-      filePath
+      filePath,
+      ...(sshFs ? { sshFs: true } : {})
     }
   }
 }
@@ -590,6 +613,9 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
       ...(n.parentId ? { parentId: n.parentId, extent: 'parent' as const } : {}),
       data: {
         title: n.title,
+        // Default true for older agent nodes saved before titleAuto existed, so they start
+        // tracking the session name; non-agent nodes ignore it.
+        titleAuto: n.titleAuto ?? true,
         color: n.color,
         group: n.group,
         tags: n.tags,
@@ -605,6 +631,7 @@ export function nodeStatesToFlow(states: CanvasNodeState[]): CanvasNode[] {
         agentId,
         ssh: n.ssh,
         sshRemoteTmux: n.sshRemoteTmux,
+        sshFs: n.sshFs,
         worktree: n.worktree
       }
     }
@@ -644,6 +671,7 @@ export function flowToNodeStates(nodes: CanvasNode[]): CanvasNodeState[] {
             : n.measured?.height ?? n.height ?? sizeFor(kind).height
         },
         title: n.data.title,
+        titleAuto: n.data.titleAuto,
         color: n.data.color,
         group: n.data.group,
         tags: n.data.tags,
@@ -659,6 +687,7 @@ export function flowToNodeStates(nodes: CanvasNode[]): CanvasNodeState[] {
         agentId: n.data.agentId,
         ssh: n.data.ssh,
         sshRemoteTmux: n.data.sshRemoteTmux,
+        sshFs: n.data.sshFs,
         worktree: n.data.worktree
       }
     })

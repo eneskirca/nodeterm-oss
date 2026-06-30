@@ -16,6 +16,7 @@ import { transport as localTransport } from '../terminal/local-transport'
 import { RemoteTransport } from '../terminal/remote-transport'
 import type { TerminalTransport } from '../terminal/transport'
 import { patchTerminalScale } from '../terminal/scale-fix'
+import { parseOsc52 } from '../terminal/osc52'
 import { FindBar } from '../components/FindBar'
 import { IconSearch } from '../components/icons'
 import { NodeTags } from '../components/NodeTags'
@@ -29,7 +30,7 @@ import { useAgentNodes } from '../state/agentNodes'
 import { useProjects } from '../state/projects'
 import { useSshConn } from '../state/sshConn'
 import { COLLAPSED_HEIGHT, NODE_COLORS, type CanvasNode } from '../state/workspace'
-import { hasHooks, canRecur, canContextLink, hasUsage, canChat, canResume, resumeCommand, agentConfig, type AgentId } from '@shared/agents/config'
+import { hasHooks, canRecur, canContextLink, hasUsage, canChat, canResume, canRename, resumeCommand, agentConfig, type AgentId } from '@shared/agents/config'
 import { buildSshArgs, type SshConnection } from '@shared/ssh'
 
 /** Backslash-escape shell-special characters, like a native terminal does on file drop. */
@@ -48,7 +49,16 @@ function escapeDroppedPath(p: string): string {
 async function resolveSshRemote(
   conn: SshConnection,
   cwd: string | undefined
-): Promise<{ controlPath: string; conn: SshConnection; remoteCwd: string } | undefined> {
+): Promise<
+  | {
+      controlPath: string
+      conn: SshConnection
+      remoteCwd: string
+      hookEndpointPath?: string
+      tmuxConfPath?: string
+    }
+  | undefined
+> {
   const projectId = useProjects.getState().activeProjectId
   let controlPath = useSshConn.getState().getControlPath(projectId)
   if (!controlPath) {
@@ -62,14 +72,20 @@ async function resolveSshRemote(
         resolve(v)
       }
       const unsub = useSshConn.subscribe((s) => {
-        const v = s.byProject[projectId]
+        const v = s.byProject[projectId]?.controlPath
         if (v) finish(v)
       })
       const timer = setTimeout(() => finish(useSshConn.getState().getControlPath(projectId)), 20000)
     })
   }
   if (!controlPath) return undefined
-  return { controlPath, conn, remoteCwd: cwd || '~' }
+  // The remote hook endpoint (reverse tunnel + remote install) is set up alongside the master;
+  // pass it through so the remote tmux session carries the hook env. Optional (fail-open).
+  const hookEndpointPath = useSshConn.getState().getHookEndpointPath(projectId)
+  // The remote tmux config (mouse on → scroll; set-clipboard on → OSC 52) is written + sourced
+  // alongside the master; pass its path so a fresh remote session launches with `-f`. Optional.
+  const tmuxConfPath = useSshConn.getState().getTmuxConfPath(projectId)
+  return { controlPath, conn, remoteCwd: cwd || '~', hookEndpointPath, tmuxConfPath }
 }
 
 /**
@@ -118,6 +134,16 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
   const [mdHtml, setMdHtml] = useState('')
   const [editingTitle, setEditingTitle] = useState(false)
   const hoveredRef = useRef(false)
+  // Live mirrors for the once-mounted onTitleChange listener (its `[]`-deps closure can't see
+  // fresh props/state): whether the title still auto-tracks the session, whether the rename box
+  // is open (don't clobber mid-edit), and the current title (skip no-op updates).
+  const titleAutoRef = useRef(data.titleAuto !== false)
+  const editingTitleRef = useRef(false)
+  const titleRef = useRef(data.title as string)
+  // Rename-box bookkeeping: the value when editing began (for Escape-revert) and a one-shot
+  // flag so the blur that follows Enter/Escape doesn't commit a second time.
+  const titleEditStartRef = useRef('')
+  const skipBlurRef = useRef(false)
   const mdMode = !!data.mdMode
   const collapsed = !!data.collapsed
   const tags = (data.tags as string[]) ?? []
@@ -130,7 +156,13 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
   const showLink = !!agentId && canContextLink(agentId) // context-link handles
   const showUsage = !!agentId && hasUsage(agentId) // per-node context-window meter
   const showChat = !!agentId && canChat(agentId) // Cmd+M opens a chat panel instead of markdown
+  const canRenameNode = !!agentId && canRename(agentId) // title ⇄ session-name two-way sync
   const agentLabel = (agentId ? agentConfig(agentId) : undefined)?.label ?? 'Agent'
+
+  // Keep the listener's mirrors current every render.
+  titleAutoRef.current = data.titleAuto !== false
+  editingTitleRef.current = editingTitle
+  titleRef.current = data.title as string
   // "Move into worktree" affordance: shown only when this terminal is a child of a group that
   // is bound to a worktree AND its current cwd differs from that worktree path (i.e. it's still
   // running in the old folder). Reads the parent group from React Flow state (single source of
@@ -229,6 +261,18 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
     fit.fit()
     patchTerminalScale(term, getZoom)
 
+    // OSC 52 clipboard write: the remote tmux (set-clipboard on) emits OSC 52 on copy; route the
+    // decoded text to the Mac clipboard. WRITE-ONLY — `parseOsc52` returns null for a `?` read
+    // query so a remote program can never read the local clipboard. Returning true swallows the
+    // sequence (also the read query). This is additive: the local tmux conf also has set-clipboard
+    // on, so local tmux DOES emit OSC 52 and this handler fires too — a harmless redundant write of
+    // the same selection (pbcopy already wrote it), NOT a no-op.
+    term.parser.registerOscHandler(52, (data) => {
+      const text = parseOsc52(data)
+      if (text !== null) window.nodeTerminal.clipboard.writeText(text)
+      return true
+    })
+
     // Cmd+C copies the terminal selection (xterm renders to canvas, so the DOM-selection
     // copy used elsewhere can't see it). Ctrl+C is left alone so it still sends SIGINT.
     term.attachCustomKeyEventHandler((e) => {
@@ -265,6 +309,8 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
         term.onTitleChange((t) => {
           const title = t.trim()
           // Ignore path/prompt-like titles (e.g. "user@host: ~/dir") which aren't session names.
+          // This feeds the `session` chip only; the node title is synced from the transcript's
+          // authoritative session name instead (see the readSessionName effect below).
           if (title && !/[/:~]/.test(title)) useAgentStatus.getState().setSession(id, title)
         }).dispose
       )
@@ -472,19 +518,34 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
     const rt = e.relatedTarget as Node | null
     if (!rt || !(e.currentTarget as HTMLElement).contains(rt)) setDropping(false)
   }
-  const onBodyDrop = (e: React.DragEvent) => {
+  const onBodyDrop = async (e: React.DragEvent) => {
     const files = Array.from(e.dataTransfer.files)
     setDropping(false)
     if (!files.length) return
     e.preventDefault()
     e.stopPropagation()
-    const paths = files
-      .map((f) => window.nodeTerminal.getPathForFile(f))
-      .filter(Boolean)
-      .map(escapeDroppedPath)
-    if (!paths.length) return
     const term = termRef.current
     if (!term) return
+
+    let paths: string[]
+    if (data.sshRemoteTmux) {
+      // Remote terminal: a local path is useless on the remote host. Upload each file over the
+      // project's ControlMaster and paste the REMOTE absolute path instead. Fail-open: skip nulls.
+      const projectId = useProjects.getState().activeProjectId
+      const uploaded = await Promise.all(
+        files.map((f) => {
+          const lp = window.nodeTerminal.getPathForFile(f)
+          return lp ? window.nodeTerminal.sshProject.uploadFile(projectId, lp, f.name) : Promise.resolve(null)
+        })
+      )
+      paths = uploaded.filter((p): p is string => !!p).map(escapeDroppedPath)
+    } else {
+      paths = files
+        .map((f) => window.nodeTerminal.getPathForFile(f))
+        .filter(Boolean)
+        .map(escapeDroppedPath)
+    }
+    if (!paths.length) return
     // Enter the terminal and paste the path(s) like a real drop (trailing space to continue).
     if (dwellRef.current) clearTimeout(dwellRef.current)
     setArmed(false)
@@ -493,17 +554,70 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
     useAgentStatus.getState().setActive(id, true)
   }
 
+  // A rename-capable agent's session name follows the node title: push `/rename <name>` into
+  // the live session (tmux send-keys, like Branch's /branch). No-op for other agents/shells.
+  const pushSessionRename = (name: string) => {
+    if (canRenameNode && name) void window.nodeTerminal.pty.sendText(id, `/rename ${name}`)
+  }
+
+  // The user took over the name (manual rename or ✦ AI-name): stop auto-tracking the session
+  // and, for rename-capable agents, push the chosen name back to the session.
+  const applyManualTitle = (raw: string) => {
+    const name = raw.trim()
+    updateNodeData(id, { title: name, titleAuto: false })
+    pushSessionRename(name)
+  }
+
+  // Close the rename box, committing only if the value actually changed (so just clicking in
+  // and out doesn't take ownership or fire a spurious /rename).
+  const commitTitleEdit = (value: string) => {
+    setEditingTitle(false)
+    if (value.trim() !== titleEditStartRef.current.trim()) applyManualTitle(value)
+  }
+
   const nameWithAi = async () => {
     setNaming(true)
     const r = await window.nodeTerminal.pty.generateName(id, (data.cwd as string) ?? '')
     setNaming(false)
-    if (r.ok) updateNodeData(id, { title: r.message })
+    if (r.ok) applyManualTitle(r.message)
   }
 
   // Selecting a node clears its unread badge.
   useEffect(() => {
     if (selected) useAgentStatus.getState().clearUnread(id)
   }, [selected, id])
+
+  // Keep the node title in sync with the agent session's display name — the name shown in
+  // `/resume`, read from the transcript (`/rename` name, else auto name). This is the authoritative
+  // source: `/rename` doesn't update the OSC terminal title, so reading the transcript is the only
+  // way the name shows up after a resume. Polls only while the title still auto-tracks the session
+  // (titleAuto) and stops once the user renames by hand. Claude-only via canRenameNode.
+  useEffect(() => {
+    if (!canRenameNode || data.titleAuto === false) return
+    const sid = status?.sessionId ?? ''
+    const cwd = (data.cwd as string) ?? ''
+    if (!sid && !cwd) return
+    let cancelled = false
+    const sync = async () => {
+      if (!titleAutoRef.current || editingTitleRef.current) return
+      const name = await window.nodeTerminal.pty.readSessionName(sid, cwd)
+      if (
+        !cancelled &&
+        name &&
+        titleAutoRef.current &&
+        !editingTitleRef.current &&
+        name !== titleRef.current
+      ) {
+        updateNodeData(id, { title: name })
+      }
+    }
+    void sync()
+    const timer = setInterval(() => void sync(), 4000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [id, canRenameNode, status?.sessionId, data.cwd, data.titleAuto, updateNodeData])
 
   // Cmd/Ctrl+M toggles markdown view of this terminal's output (only when hovered).
   useEffect(() => {
@@ -624,16 +738,35 @@ export function TerminalNode({ id, data, selected, parentId }: NodeProps<CanvasN
             spellCheck={false}
             autoFocus
             onChange={(e) => updateNodeData(id, { title: e.target.value })}
-            onBlur={() => setEditingTitle(false)}
+            // Enter commits, Escape reverts to the value editing started with. The blur that
+            // follows either keypress is skipped (skipBlurRef) so we don't commit twice; a plain
+            // focus-loss blur still commits.
+            onBlur={(e) => {
+              if (skipBlurRef.current) {
+                skipBlurRef.current = false
+                return
+              }
+              commitTitleEdit(e.currentTarget.value)
+            }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === 'Escape') setEditingTitle(false)
+              if (e.key === 'Enter') {
+                skipBlurRef.current = true
+                commitTitleEdit(e.currentTarget.value)
+              } else if (e.key === 'Escape') {
+                skipBlurRef.current = true
+                updateNodeData(id, { title: titleEditStartRef.current })
+                setEditingTitle(false)
+              }
             }}
           />
         ) : (
           <span
             className="term-node__title-text nodrag"
             title="Click to rename"
-            onClick={() => setEditingTitle(true)}
+            onClick={() => {
+              titleEditStartRef.current = data.title as string
+              setEditingTitle(true)
+            }}
           >
             {data.title || 'Untitled'}
           </span>

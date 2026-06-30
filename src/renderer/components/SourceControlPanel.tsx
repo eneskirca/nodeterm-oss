@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { GitFileChange, GitResult, GitStatus } from '@shared/types'
 import type { GitHistoryItem, GitHistoryResult } from '@shared/git-history'
 import { useProjects } from '../state/projects'
+import { useSettings } from '../state/settings'
+import { useSshConn } from '../state/sshConn'
 import { useScmDraft } from '../state/scmDraft'
 import { GitHistoryPanel } from './git-history/GitHistoryPanel'
 import { buildCommitMenuItems } from './git-history/git-history-menu'
@@ -16,6 +18,8 @@ interface SourceControlPanelProps {
   onOpenCommitDiff: (relPath: string, commitOid: string) => void
   onExplainCommit: (prompt: string) => void
 }
+
+const AUTO_FETCH_MS = 180_000
 
 const STATUS_COLOR: Record<string, string> = {
   M: '#ffd60a',
@@ -44,7 +48,15 @@ export function SourceControlPanel({
   onExplainCommit
 }: SourceControlPanelProps) {
   const project = useProjects((s) => s.projects.find((p) => p.id === s.activeProjectId))
-  const cwd = project?.cwd
+  // SSH project: git ops run on the remote repo over the master, so the cwd is the project's
+  // exact remoteCwd (the remote-git registry matches by exact string — must not be transformed).
+  // Local projects are byte-identical (the SSH branch fires only when `project.ssh` is set).
+  const isSsh = !!project?.ssh
+  const cwd = project?.ssh?.remoteCwd ?? project?.cwd
+  // For an SSH project the master may still be connecting when the panel mounts; its controlPath
+  // appears once `setConn` runs (after `setActiveRemote` arms remote routing). Observing it lets the
+  // refresh re-run when the master connects. Local projects have no entry → undefined → no effect.
+  const sshControlPath = useSshConn((s) => (project?.id ? s.byProject[project.id]?.controlPath : undefined))
   const [status, setStatus] = useState<GitStatus | null>(null)
   // Commit message + AI-generate state live in a per-repo store (keyed by cwd), so closing the
   // panel mid-generation neither discards the message nor abandons the run — reopening shows it.
@@ -79,7 +91,12 @@ export function SourceControlPanel({
 
   const refresh = useCallback(async () => {
     setStatus(cwd ? await git.status(cwd) : null)
-  }, [cwd, git])
+    // `sshControlPath` is a dep so an SSH project whose master finishes connecting after the panel
+    // opened re-fetches once the connection is live (instead of staying "no repo"/empty).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cwd, git, sshControlPath])
+
+  const autoFetchOn = useSettings((s) => s.settings.gitAutoFetch)
 
   const refreshHistory = useCallback(async () => {
     if (!cwd) {
@@ -100,6 +117,35 @@ export function SourceControlPanel({
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  // Keep `refresh` current without re-creating the interval below on every status change.
+  const refreshRef = useRef(refresh)
+  useEffect(() => {
+    refreshRef.current = refresh
+  }, [refresh])
+
+  // Auto-fetch while the panel is open so ahead/behind ("Synced") stays accurate — git's ahead/
+  // behind is computed against the local remote-tracking ref, which only updates on `git fetch`.
+  // SSH-project repos fetch on the remote via the Phase-4 chokepoint. Silent + fail-open: a failed
+  // fetch is swallowed (status left as-is), bypassing the act() busy/error UI.
+  useEffect(() => {
+    if (!cwd || !autoFetchOn) return
+    let cancelled = false
+    const tick = async (): Promise<void> => {
+      try {
+        await git.fetch(cwd)
+        if (!cancelled) await refreshRef.current()
+      } catch {
+        /* offline / auth / no remote — keep the last good status */
+      }
+    }
+    void tick() // once on open (or cwd/connection change)
+    const id = setInterval(() => void tick(), AUTO_FETCH_MS)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [cwd, autoFetchOn, sshControlPath, git])
 
   useEffect(() => {
     void refreshHistory()
@@ -188,7 +234,11 @@ export function SourceControlPanel({
    */
   const renderRemoteAction = () => {
     if (!status) return null
+    // gh-based "Publish to GitHub" is local-only: gh isn't bridged over the SSH master yet, so
+    // SSH projects hide it (a future follow-up could detect remote gh). Plain git push/pull/sync
+    // below still route remotely via the chokepoint.
     if (!status.hasRemote) {
+      if (isSsh) return null
       return (
         <button
           className="scm-sync"
@@ -541,8 +591,20 @@ export function SourceControlPanel({
         <ContextMenu
           x={moreMenu.x}
           y={moreMenu.y}
+          zIndex={80}
           onClose={() => setMoreMenu(null)}
           items={[
+            // Plain Pull/Push/Sync (always available when the branch has an upstream), independent
+            // of the morphing primary button's current state — like VS Code's "…" menu. SSH-project
+            // repos route these to the remote over the master via the Phase-4 git chokepoint.
+            ...(status.hasUpstream
+              ? ([
+                  { label: 'Pull', onClick: () => void act(() => git.pull(cwd!)) },
+                  { label: 'Push', onClick: () => void act(() => git.push(cwd!)) },
+                  { label: 'Sync', onClick: () => void act(() => git.sync(cwd!)) },
+                  { type: 'separator' }
+                ] as MenuItem[])
+              : []),
             { label: 'Fetch', onClick: () => void act(() => git.fetch(cwd!)) },
             {
               label: 'Force Push',
@@ -582,6 +644,7 @@ export function SourceControlPanel({
         <ContextMenu
           x={branchPick.x}
           y={branchPick.y}
+          zIndex={80}
           onClose={() => setBranchPick(null)}
           items={
             status.branches
